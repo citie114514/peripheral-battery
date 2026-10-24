@@ -234,6 +234,13 @@ def run_with(runtime, panel_only=False):
 
     def after_start():
         """界面起来之后再挂托盘；同时盯 10 秒窗口尺寸（pywebview 偶发 158×26 竞争）。"""
+        # resizable=False 时 pywebview 偶尔不会自己 show；用它自己的 show 而不是 Win32
+        # （Win32 SW_RESTORE 在不可调整大小的 Form 上会把窗口搞成关闭状态）
+        try:
+            window.show()
+        except Exception:
+            pass
+
         def watch_size():
             for _ in range(33):          # 10 秒内每 300ms 检查一次
                 try:
@@ -275,7 +282,7 @@ def _win32_show():
         hwnd = user32.FindWindowW(None, APP_NAME)
         if hwnd:
             _fix_window_size(hwnd)
-            user32.ShowWindow(hwnd, 9)
+            user32.ShowWindow(hwnd, 5)          # SW_SHOW（不要用 SW_RESTORE）
             user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
