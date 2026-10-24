@@ -280,6 +280,7 @@ button{font:inherit;cursor:pointer;border:0;background:none;color:inherit}
     <div class="right">
       <div class="detail" id="detail">选一个接口查看详情</div>
       <button class="btn ghost" id="btnDump" style="align-self:flex-start">转储输入报告 2 秒</button>
+      <button class="btn ghost" id="btnPmoCfg" style="align-self:flex-start">读键盘灯光/休眠配置</button>
       <div class="trace" id="trace"></div>
       <button class="btn ghost" id="btnCloseDebug" style="align-self:flex-end">关闭</button>
     </div>
@@ -518,6 +519,10 @@ $('btnDump').onclick = async () => {
   $('trace').textContent = '采样中…';
   const lines = await call('dump_reports', parseInt(sel.dataset.i, 10));
   $('trace').textContent = lines.join('\n') || '（2 秒内没有任何输入报告）';
+};
+$('btnPmoCfg').onclick = async () => {
+  $('trace').textContent = '读取中…（键盘休眠时会读不到）';
+  $('trace').textContent = await call('pmo_config');
 };
 
 /* 与 Python 同步：轮询状态（WebView2 不允许后台线程直接改 UI） */

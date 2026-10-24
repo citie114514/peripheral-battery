@@ -16,6 +16,7 @@ import threading
 import time
 
 import hidlib
+import protocols
 import webview
 from periph_battery import (APP_NAME, INTERVALS, Runtime, Tray, autostart_enabled,
                             save_config, set_autostart)
@@ -148,6 +149,25 @@ class Api:
             f"Usage     0x{(rec.usage_page or 0):04X} / 0x{(rec.usage or 0):04X}",
             f"报告长度  in={rec.in_len}  out={rec.out_len}  feature={rec.feat_len}",
             f"描述      {rec.desc!r}",
+        ])
+
+    def pmo_config(self):
+        """键盘的灯光 / 休眠配置（给调试面板对比「关灯前后」用）。"""
+        iface = hidlib.find_interface(hidlib.enumerate_interfaces(),
+                                       0x36B0, 0x3002, 0xFF00)
+        info = protocols.read_pmo_funcinfo(iface, hidlib.enumerate_interfaces())
+        if not info:
+            return "读不到（键盘休眠中，先按几下键盘唤醒）"
+        def fmt(value, unit=""):
+            return "未设置" if value is None else f"{value}{unit}"
+        return "\n".join([
+            f"灯光开关  {info['light_switch']}  （0=关 1=开）",
+            f"灯效/亮度 {info['light_mode']} / {info['brightness']}",
+            f"休眠时间  {fmt(info['sleep_minutes'], ' 分钟')}",
+            f"深度休眠  {fmt(info['deep_sleep_minutes'], ' 分钟')}",
+            "",
+            "原始 41 字节:",
+            info["raw"],
         ])
 
     def dump_reports(self, index):

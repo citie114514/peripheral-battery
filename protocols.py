@@ -143,12 +143,13 @@ def read_pmo_keyboard(iface, trace=None, interfaces=None):
         result["state"] = "disconnected"
         return result
 
-    # 两个可能的主通道都试：0xFF00（64 字节，report id 0x3F）和 0xFF60（32 字节，report id 0）
-    channels = [(iface, PMO_OUT_IDS)]
+    # 两个可能的主通道都试：0xFF60（32 字节帧，实测这个才是通的）和 0xFF00（64 字节）
+    channels = []
     if interfaces:
         alt = find_interface(interfaces, PMO_KEYBOARD["vid"], PMO_KEYBOARD["pid"], 0xFF60)
-        if alt is not None and alt.path != iface.path:
+        if alt is not None:
             channels.append((alt, (0x00,)))
+    channels.append((iface, PMO_OUT_IDS))
 
     detail = ""
     for chan, rids in channels:
@@ -158,34 +159,27 @@ def read_pmo_keyboard(iface, trace=None, interfaces=None):
                 continue
             for rid in rids:
                 h.drain()
-                # 不等 START 的 ack（很多固件不回它），先把电池命令直接怼上去
-                for _attempt in range(3):
-                    hit = _pmo_cmd(h, rid, PMO_BATTERY, 0, PMO_CHUNK,
-                                   timeout=0.5, trace=trace)
-                    if hit:
+                # 关键：必须先 0x10 握手拿到 0x55，否则后面的命令一律回 0x0F
+                if not _pmo_cmd(h, rid, PMO_START, length=PMO_CHUNK, timeout=0.8,
+                                trace=trace):
+                    detail = detail or "握手无回应（键盘休眠中）"
+                    continue
+                try:
+                    for _attempt in range(3):
+                        hit = _pmo_cmd(h, rid, PMO_BATTERY, 0, PMO_CHUNK,
+                                       timeout=0.6, trace=trace)
+                        if not hit:
+                            time.sleep(0.12)
+                            continue
                         frame, status = hit
                         if status == PMO_OK and len(frame) >= 10 and 0 <= frame[8] <= 100:
-                            result.update(percent=frame[8], charging=bool(frame[9]),
+                            result.update(percent=frame[8],
+                                          charging=bool(frame[9]),
                                           state="ok", detail="")
                             return result
                         detail = f"键盘回复状态 0x{status:02X}"
-                    time.sleep(0.15)
-                # 再试一次完整握手（开始通讯 → 设备信息 → 电池）
-                if _pmo_cmd(h, rid, PMO_START, length=PMO_CHUNK, timeout=0.6, trace=trace):
-                    try:
-                        _pmo_cmd(h, rid, PMO_INFO, 0, 56, timeout=0.6, trace=trace)
-                        hit = _pmo_cmd(h, rid, PMO_BATTERY, 0, PMO_CHUNK, timeout=0.8,
-                                       trace=trace)
-                        if hit:
-                            frame, status = hit
-                            if status == PMO_OK and len(frame) >= 10 and 0 <= frame[8] <= 100:
-                                result.update(percent=frame[8],
-                                              charging=bool(frame[9]),
-                                              state="ok", detail="")
-                                return result
-                            detail = f"键盘回复状态 0x{status:02X}（不支持该指令）"
-                    finally:
-                        _pmo_cmd(h, rid, PMO_STOP, timeout=0.3)
+                finally:
+                    _pmo_cmd(h, rid, PMO_STOP, timeout=0.3)
 
     # 退一步：用接收器自己的状态通道判断键盘是不是根本没上线
     alive = _pmo_presence(interfaces, trace)
@@ -200,7 +194,73 @@ def read_pmo_keyboard(iface, trace=None, interfaces=None):
     return result
 
 
+# --- 键盘的灯光/休眠配置（诊断用，只读）------------------------------
+def read_pmo_funcinfo(iface=None, interfaces=None, trace=None):
+    """读 RDR 的 funcInfo（0x14，41 字节）。返回 dict 或 None。
+
+    实测必须先发 0x10（开始通讯）拿到 0x55，否则后续命令一律 0x0F；
+    而且真正通的通道是 0xFF60（32 字节帧，report id 0）。
+    字段下标来自 PMOHub 的 xr() 解析：
+      [1] 灯光开关  [2] 灯效  [3] 亮度  [4] 速度
+      [35..37] sleepTime（LE24，分钟）  [38..40] deepSleepTime（LE24，分钟）
+    """
+    chan = iface
+    if interfaces:
+        alt = find_interface(interfaces, PMO_KEYBOARD["vid"], PMO_KEYBOARD["pid"], 0xFF60)
+        if alt is not None:
+            chan = alt
+    if chan is None:
+        return None
+    with chan.open(read=True, write=True) as h:
+        if not h.ok:
+            return None
+        h.drain()
+        if not _pmo_cmd(h, 0x00, PMO_START, length=PMO_CHUNK, timeout=0.8, trace=trace):
+            return None
+        try:
+            # funcInfo 有 41 字节，而 32 字节帧一帧只装 24 字节 → 按 offset 分片读
+            total = 41
+            data = bytearray()
+            offset = 0
+            while len(data) < total:
+                want = min(PMO_CHUNK, total - len(data))
+                hit = _pmo_cmd(h, 0x00, PMO_FUNC, offset, want, timeout=0.8, trace=trace)
+                if not hit:
+                    return None
+                frame, status = hit
+                if status != PMO_OK:
+                    return None
+                chunk = frame[8:8 + want]
+                if not chunk:
+                    return None
+                data += chunk
+                offset += len(chunk)
+            data = bytes(data[:total])
+
+            def le24(b):
+                """三个字节的值。0xFFFF 开头 = 未设置（固件用 FF FF 当无效标记）。"""
+                if b[0] == 0xFF and b[1] == 0xFF:
+                    return None
+                return b[0] | (b[1] << 8) | (b[2] << 16)
+
+            return {
+                "light_switch": data[1],
+                "light_mode": data[2],
+                "brightness": data[3],
+                "speed": data[4],
+                "scan_delay": data[33],
+                "layer_default": data[34],
+                "sleep_minutes": le24(data[35:38]),
+                "deep_sleep_minutes": le24(data[38:41]),
+                "raw": " ".join(f"{b:02X}" for b in data),
+            }
+        finally:
+            _pmo_cmd(h, 0x00, PMO_STOP, timeout=0.3)
+    return None
+
+
 def _pmo_presence(interfaces, trace=None):
+    """0xFF60 通道上的 0xD0 轮询：能拿到回复说明接收器在，但键盘未必醒着。"""
     """0xFF60 通道上的 0xD0 轮询：能拿到回复说明接收器在，但键盘未必醒着。"""
     if not interfaces:
         return None
