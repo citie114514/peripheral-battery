@@ -8,6 +8,7 @@
   所以数据改由前端 600ms 轮询 api.state()。
 * 托盘点击回到前台用 Win32 ShowWindow，不走 pywebview 的 native 对象。
 """
+import ctypes
 import json
 import os
 import sys
@@ -18,6 +19,8 @@ import hidlib
 import webview
 from periph_battery import (APP_NAME, INTERVALS, Runtime, Tray, autostart_enabled,
                             save_config, set_autostart)
+
+WINDOW_W, WINDOW_H = 1000, 680
 
 
 def resource_path(*parts):
@@ -30,6 +33,18 @@ def resource_path(*parts):
 def load_html():
     with open(resource_path("ui", "index.html"), "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+def webview_storage_dir():
+    """WebView2 的独立 user data 目录。
+
+    不指定的话会跟系统 Edge 共用浏览器进程，实测会把我们的窗口变成一个
+    158×26 的空壳，界面跑到 Edge 的 InPrivate 窗口里。
+    """
+    base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                        "PeripheralBattery", "WebView2")
+    os.makedirs(base, exist_ok=True)
+    return base
 
 
 class Api:
@@ -164,8 +179,8 @@ def run_with(runtime, panel_only=False):
     window = webview.create_window(
         APP_NAME,
         html=load_html(),
-        width=1000,
-        height=680,
+        width=WINDOW_W,
+        height=WINDOW_H,
         resizable=True,
         background_color="#F4F0E7",
         js_api=api,
@@ -198,7 +213,17 @@ def run_with(runtime, panel_only=False):
                 _win32_show()
 
     def after_start():
-        """界面起来之后再挂托盘，避开 pywebview 初始化时的窗口尺寸竞争。"""
+        """界面起来之后再挂托盘；同时盯 10 秒窗口尺寸（pywebview 偶发 158×26 竞争）。"""
+        def watch_size():
+            for _ in range(33):          # 10 秒内每 300ms 检查一次
+                try:
+                    if _fix_window_size():
+                        _log("[webapp] 窗口尺寸异常，已纠正")
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+        threading.Thread(target=watch_size, daemon=True).start()
         if not panel_only:
             tray = Tray(runtime)
             runtime.tray = tray
@@ -209,10 +234,19 @@ def run_with(runtime, panel_only=False):
 
     # 注意：pywebview 的 debug=True 会拉起 devtools 并把窗口挤成 158×26，
     # 所以我们的 --debug 只控制自己的终端输出，不交给 pywebview。
-    webview.start(after_start)
+    webview.start(after_start, storage_path=webview_storage_dir())
     runtime.quitting = True
     runtime._stop.set()
     runtime._refresh.set()
+
+
+def _log(text):
+    """--windowed 打包后 stdout 是 None，print 会抛异常，统一走这里。"""
+    try:
+        if sys.stderr is not None:
+            print(text, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def _win32_show():
@@ -220,10 +254,40 @@ def _win32_show():
     try:
         hwnd = user32.FindWindowW(None, APP_NAME)
         if hwnd:
+            _fix_window_size(hwnd)
             user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
+
+
+def _fix_window_size(hwnd=None):
+    """pywebview 偶尔会把窗口建成 158×26（尺寸竞争），这里发现就拉回目标大小。"""
+    from ctypes import wintypes as wt
+    from periph_battery import user32
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [("l", wt.LONG), ("t", wt.LONG), ("r", wt.LONG), ("b", wt.LONG)]
+
+    try:
+        if not hwnd:
+            hwnd = user32.FindWindowW(None, APP_NAME)
+        if not hwnd:
+            return False
+        rect = _RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        width, height = rect.r - rect.l, rect.b - rect.t
+        if width >= 600 and height >= 400:
+            return False
+        # 未声明 DPI 感知，坐标是虚拟像素；按屏幕比例算目标尺寸
+        screen_w = user32.GetSystemMetrics(0) or 1920
+        screen_h = user32.GetSystemMetrics(1) or 1080
+        want_w = min(WINDOW_W, int(screen_w * 0.82))
+        want_h = min(WINDOW_H, int(screen_h * 0.86))
+        user32.SetWindowPos(hwnd, None, 0, 0, want_w, want_h, 0x0002 | 0x0004)  # NOMOVE|NOZORDER
+        return True
+    except Exception:
+        return False
 
 
 def _post_close():

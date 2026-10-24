@@ -71,6 +71,9 @@ user32.TrackPopupMenu.argtypes = [w.HMENU, w.UINT, ctypes.c_int, ctypes.c_int,
                                   ctypes.c_int, w.HWND, ctypes.c_void_p]
 user32.DestroyMenu.argtypes = [w.HMENU]
 user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, w.UINT]
+user32.GetWindowRect.argtypes = [w.HWND, ctypes.c_void_p]
 
 shell32.Shell_NotifyIconW.argtypes = [w.DWORD, ctypes.c_void_p]
 
@@ -105,6 +108,14 @@ ID_OPEN, ID_REFRESH, ID_AUTOSTART, ID_QUIT = 1, 2, 3, 4
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 IDI_APPLICATION = 32512
+
+user32.RegisterWindowMessageW.restype = w.UINT
+user32.RegisterWindowMessageW.argtypes = [w.LPCWSTR]
+# Explorer 重启 / 通知区重建时广播的消息，收到就必须重新挂图标
+TASKBAR_CREATED = user32.RegisterWindowMessageW("TaskbarCreated")
+
+TIMER_RETRY = 2          # 图标没挂上时的快速重试定时器 id
+ICON_TTL = 12.0          # 旧 HICON 延迟回收，Explorer 可能还在引用
 
 
 class GUID(ctypes.Structure):
@@ -261,15 +272,29 @@ def write_shortcut(lnk):
 
 # ----------------------------------------------------------------- 托盘
 class Tray(threading.Thread):
+    """托盘线程。
+
+    「图标偶尔消失」的三种成因和对应处理：
+    1. Explorer 重启 / 通知区重建（主题切换、资源管理器崩溃、Win+Q 刷新）
+       → 监听 TaskbarCreated 广播消息，收到就全部重新 NIM_ADD。
+    2. 开机自启时我们比 Explorer 的通知区更早起来，NIM_ADD 会直接失败
+       → 起一个 2 秒的快速重试定时器，挂上为止。
+    3. NIM_MODIFY 返回成功但其实图标早没了（通知区里已经没我们）
+       → 每次刷新都校验，MODIFY 失败就退回 ADD。
+    另外：旧 HICON 不立刻 DestroyIcon（Explorer 可能还在引用），延迟回收。
+    """
+
     def __init__(self, runtime):
         super().__init__(daemon=True)
         self.runtime = runtime
         self.hwnd = None
         self.icons = {}
+        self._graveyard = []          # [(可销毁时间, HICON)]
+        self._added = set()           # 确认在通知区里的 uid
         self._proc = WNDPROC(self._wndproc)
         self.ready = threading.Event()
 
-    # --- 窗口过程
+    # ------------------------------------------------ 窗口过程
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_TRAY_CALLBACK:
@@ -280,7 +305,10 @@ class Tray(threading.Thread):
                     self.runtime.request_panel()
                 return 0
             if msg == WM_TIMER:
-                self.runtime.request_refresh("定时刷新")
+                if int(wparam) == TIMER_RETRY:
+                    self._ensure_icons()
+                else:
+                    self.runtime.request_refresh("定时刷新")
                 return 0
             if msg == WM_SHOW_PANEL:
                 self.runtime.request_panel()
@@ -288,16 +316,25 @@ class Tray(threading.Thread):
             if msg == WM_REFRESH_ICONS:
                 self._apply_icons()
                 return 0
+            if TASKBAR_CREATED and msg == TASKBAR_CREATED:
+                self.runtime.note("通知区被重建，重新挂图标")
+                self._added.clear()
+                self._ensure_icons()
+                return 0
             if msg == WM_DESTROY:
                 for uid in list(self.icons):
                     self._notify(NIM_DELETE, uid)
-                user32.PostQuitMessage(0)
+                for _when, handle in self._graveyard:
+                    user32.DestroyIcon(handle)
+                self._graveyard.clear()
+                user32.PostQuitMessage(0)   # 关键：否则进程变僵尸还占着单实例锁
                 return 0
         except Exception:
             if self.runtime.debug:
                 traceback.print_exc()
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
+    # ------------------------------------------------ Shell_NotifyIcon
     def _notify(self, action, uid, tip=None):
         nid = NOTIFYICONDATAW()
         nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
@@ -307,11 +344,35 @@ class Tray(threading.Thread):
         nid.uCallbackMessage = WM_TRAY_CALLBACK
         nid.hIcon = self.icons.get(uid, 0) or user32.LoadIconW(None, IDI_APPLICATION)
         nid.szTip = (tip or APP_NAME)[:127]
-        return shell32.Shell_NotifyIconW(action, ctypes.byref(nid))
+        return bool(shell32.Shell_NotifyIconW(action, ctypes.byref(nid)))
+
+    def _ensure_icons(self):
+        """补挂缺失的图标。
+
+        注意 NIM_ADD 在「图标已存在」时也会返回 False，所以 ADD 失败要再用
+        NIM_MODIFY 探一下：MODIFY 成功说明图标本来就在（比如刚发 TaskbarCreated
+        但 Explorer 还没真的清空）。两边都失败才算真没挂上，才继续重试。
+        """
+        missing = False
+        for index, info in enumerate(self.runtime.results):
+            if index in self._added:
+                continue
+            if not self.icons.get(index):
+                self.icons[index] = make_battery_icon(None, dim=True)
+            tip = f'余量 · {info["name"]} · 读取中'
+            if self._notify(NIM_ADD, index, tip) or self._notify(NIM_MODIFY, index, tip):
+                self._added.add(index)
+            else:
+                missing = True
+        if self.hwnd:
+            if missing:
+                user32.SetTimer(self.hwnd, TIMER_RETRY, 2000, None)
+            else:
+                user32.KillTimer(self.hwnd, TIMER_RETRY)
 
     def _apply_icons(self):
-        results = self.runtime.results
-        for index, info in enumerate(results):
+        self._reap()
+        for index, info in enumerate(self.runtime.results):
             percent = info.get("percent")
             charging = bool(info.get("charging"))
             stale = percent is None and info.get("last")
@@ -319,60 +380,46 @@ class Tray(threading.Thread):
                 percent = info["last"].get("percent")
                 charging = bool(info["last"].get("charging"))
             dim = info.get("state") != "ok"
-            old = self.icons.get(index)
+
             new = make_battery_icon(percent, charging=charging, dim=dim)
             if not new:
                 continue
+            old = self.icons.get(index)
             self.icons[index] = new
+            if old and old != new:
+                self._graveyard.append((time.time() + ICON_TTL, old))
+
             if percent is None:
                 tip = f'余量 · {info["name"]} · 未读'
             elif stale:
-                tip = f'余量 · {info["name"]} · {percent}%（休眠中，上次 {info["last"].get("time","")}）'
+                tip = (f'余量 · {info["name"]} · {percent}%'
+                       f'（休眠中，上次 {info["last"].get("time", "")}）')
             else:
                 tip = f'余量 · {info["name"]} · {percent}%'
                 if charging:
                     tip += "（充电中）"
-            self._notify(NIM_MODIFY, index, tip)
-            if old:
-                user32.DestroyIcon(old)
 
-    def _popup_menu(self):
-        """右键菜单：打开面板 / 立即刷新 / 开机自启 / 退出。"""
-        try:
-            from periph_battery import autostart_enabled, set_autostart
-        except Exception:
+            if index in self._added and self._notify(NIM_MODIFY, index, tip):
+                continue
+            self._added.discard(index)          # 通知区里可能已经没我们了
+            if self._notify(NIM_ADD, index, tip) or self._notify(NIM_MODIFY, index, tip):
+                self._added.add(index)
+        if len(self._added) < len(self.runtime.results):
+            user32.SetTimer(self.hwnd, TIMER_RETRY, 2000, None)
+
+    def _reap(self):
+        if not self._graveyard:
             return
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", w.LONG), ("y", w.LONG)]
+        now = time.time()
+        alive = []
+        for when, handle in self._graveyard:
+            if when <= now:
+                user32.DestroyIcon(handle)
+            else:
+                alive.append((when, handle))
+        self._graveyard = alive
 
-        menu = user32.CreatePopupMenu()
-        if not menu:
-            return
-        user32.AppendMenuW(menu, MF_STRING, ID_OPEN, "打开面板")
-        user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "立即刷新")
-        flags = MF_STRING | (MF_CHECKED if autostart_enabled() else 0)
-        user32.AppendMenuW(menu, flags, ID_AUTOSTART, "开机自启")
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, ID_QUIT, "退出")
-
-        pt = POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        user32.SetForegroundWindow(self.hwnd)      # 不前置的话菜单点外面不消失
-        cmd = user32.TrackPopupMenu(
-            menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON |
-            TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, self.hwnd, None)
-        user32.PostMessageW(self.hwnd, 0x0000, 0, 0)   # WM_NULL
-        user32.DestroyMenu(menu)
-
-        if cmd == ID_OPEN:
-            self.runtime.request_panel()
-        elif cmd == ID_REFRESH:
-            self.runtime.request_refresh("托盘菜单")
-        elif cmd == ID_AUTOSTART:
-            set_autostart(not autostart_enabled())
-        elif cmd == ID_QUIT:
-            self.runtime.request_quit()
-
+    # ------------------------------------------------ 线程
     def run(self):
         hinst = kernel32.GetModuleHandleW(None)
         wc = WNDCLASSW()
@@ -381,19 +428,21 @@ class Tray(threading.Thread):
         wc.lpszClassName = CLASS_NAME
         if not user32.RegisterClassW(ctypes.byref(wc)):
             err = ctypes.get_last_error()
-            if err not in (1410,):        # 已注册
+            if err not in (1410,):        # 已经注册过
                 self.runtime.note(f"托盘窗口类注册失败: {err}")
         self.hwnd = user32.CreateWindowExW(0, CLASS_NAME, "PeripheralBatteryTrayHidden",
                                            0, 0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
             self.runtime.note("托盘窗口创建失败")
             return
+        # TaskbarCreated 也要能被这个窗口收到，所以窗口类别名注册即可（广播消息）
         self.runtime.tray_hwnd = self.hwnd
-        for index, info in enumerate(protocols.DEVICES):
+        for index in range(len(self.runtime.results)):
             self.icons[index] = make_battery_icon(None, dim=True)
-            self._notify(NIM_ADD, index, f'{info["name"]}：读取中…')
+        self._ensure_icons()
         user32.SetTimer(self.hwnd, 1, max(10, self.runtime.config["interval"]) * 1000, None)
         self.ready.set()
+
         msg = w.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
