@@ -401,11 +401,12 @@ function render(s){
 
   const chip = $('chip');
   chip.className = 'chip' + (stale ? ' warn' : pct === null
-    ? (d.state === 'idle' || d.state === 'sleep' ? ' warn' : ' idle')
+    ? (d.state === 'idle' || d.state === 'sleep' || d.state === 'fake_sleep' ? ' warn' : ' idle')
     : (charging ? ' charging' : ''));
   $('chipText').textContent = stale ? '休眠中'
     : pct === null
-      ? (d.state === 'sleep' ? '休眠中' : d.state === 'idle' ? '未响应'
+      ? (d.state === 'fake_sleep' ? '假休眠'
+         : d.state === 'sleep' ? '休眠中' : d.state === 'idle' ? '未响应'
          : d.state === 'disconnected' ? '未连接' : '读取中')
       : (charging ? '充电中' : '已连接');
 
@@ -451,7 +452,7 @@ function render(s){
     const pill = pStale
       ? `<span class="pill warn">休眠 ${p}%</span>`
       : p === null
-        ? `<span class="pill ${it.state === 'idle' || it.state === 'sleep' ? 'warn' : ''}">${it.state === 'sleep' ? '休眠中' : it.state === 'idle' ? '未响应' : '读取中'}</span>`
+        ? `<span class="pill ${it.state === 'idle' || it.state === 'sleep' || it.state === 'fake_sleep' ? 'warn' : ''}">${it.state === 'fake_sleep' ? '假休眠' : it.state === 'sleep' ? '休眠中' : it.state === 'idle' ? '未响应' : '读取中'}</span>`
         : `<span class="pill ok">已连接</span>`;
     const icon = it.key === 'mouse'
       ? `<svg width="16" height="22" viewBox="0 0 16 22"><rect x="1" y="1" width="14" height="20" rx="7" fill="none" stroke="#2b2926" stroke-width="1.4"/><line x1="8" y1="1" x2="8" y2="8" stroke="#2b2926" stroke-width="1.4"/></svg>`

@@ -73,27 +73,31 @@ powershell -File build.ps1
 **现状（实测，别被驱动截图骗了）**：
 
 - 驱动里显示 `93%` 是真的——但那是**键盘醒着那一刻**读到的。
-- 键盘一旦休眠（它默认就 10 分钟级别），接收器对 `0x10/0x12/0x30` 就**完全不回**，
-  只留一个状态广播：
-  ```
-  0xFF60: AA D0 00 00 18 00 00 00 | 01 B0 36 2B 30 02   ← 最后一个字节随状态变（02/05）
-  0xFF00: AA C0 00 80 01 00 06 47 | B0 36 2B 30 02      ← 固定应答，不带电量
-  ```
-- PMOHub 自己也会卡在首页报「无法识别蓝牙模式」——说明它也是同样在等键盘醒。
-- 所以本工具的做法：键盘读不到就 **每 15 秒重试一次**（每次把电池指令重发 3 遍 +
-  一次完整握手），键盘一醒、或者你按一下键，下一次轮询就能抓到。
+- **必须先发 `0x10` 握手拿到 `0x55`**，否则后面的命令一律回 `0x0F`（这就是一开始一直读不到的真因）。
+- 真正通的通道是 **`0xFF60`（32 字节帧，report id 0）**，不是 `0xFF00`。
+- `0x14` funcInfo 有 41 字节，一帧只装 24 字节，要**按 offset 分片读**。
 
-还读不到就手动抓一次：
+### ⚠️ 已知固件 bug：关灯后「假休眠」
+
+关灯后键盘会很快进入一种**无法自主恢复**的假休眠：
+
+- 接收器仍然报「已配对、已连接」（`0xD0` 状态帧 `state` 字节从 `04` 变 `05`）
+- 键盘本体完全不响应任何 RDR 命令（连 `0x10` 握手都无回应）
+- 按物理按键没反应，**不会自己醒**，必须切到蓝牙再切回 2.4G
+- 官方驱动 PMOHub 同样复现 → 固件问题，不是驱动/本工具的问题
+
+实测读到 `deepSleepTime = 1 分钟`（`sleepTime` 是 `FF FF` 未设置），与「非常快休眠」的现象吻合。
+试过 8 种唤醒帧（`0xD0`/`0x10`×5/`0x12`/`0x14`/`0x30`/组合/全零/单字节）**全部无效**。
+
+完整取证记录：[`docs/pmo-p75-fake-sleep.md`](docs/pmo-p75-fake-sleep.md)
+
+工具会把这种状态标成「**假休眠**」并提示恢复方法。自己取证：
 
 ```bash
-python tools\watch_pmo.py        # 挂上 PMOHub 的钩子开始记录
+python tools\pmo_diag.py           # 一次性：状态帧 + 电量 + 灯光/休眠配置
+python tools\watch_sleep.py 2000   # 后台长跑：每 20 秒记一次 → download\sleep_watch.log
+python tools\try_wake.py           # 假休眠时试 8 种唤醒帧
 ```
-
-然后用键盘正常打字 1~2 分钟，日志会落在 `download\pmo_watch.log`，
-里面会包含官方驱动真正发的帧（现在拿到的是空的，因为键盘在睡）。
-
-其他排查顺序：确认在 2.4G 模式（不是蓝牙/关机）；或插 USB 线
-（有线模式 pid `302B`，代码里 `alt` 列表已包含 P75/PMO80/Aurora80/WAVE75）。
 
 ## 结构
 
@@ -121,5 +125,9 @@ python tools\watch_pmo.py        # 挂上 PMOHub 的钩子开始记录
   改成前端 600ms 轮询 `api.state()`。
 - PyInstaller 的 `--onefile` 会让 pywebview 起不来（窗口 0×0），
   所以用 `--onedir`，并把 `webview/lib` 显式 `--add-data` 进去。
+- **pywebview 的 `resizable=True` 会让窗口偶发缩成 158×26**：WebView2 子控件
+  （985×643）会反向把 WinForms Form 拉小，且 `SetWindowPos` 改不动。改成
+  `resizable=False` 后 5/5 稳定。
+- WebView2 要指定**独立 `storage_path`**，否则会复用系统 Edge 的浏览器进程。
 - 两个进程抢同一个 pywebview 窗口时，量到的窗口尺寸会互相干扰（排查时先
   `Get-Process python | Stop-Process` 清干净，否则会以为窗口只有 158×26）。

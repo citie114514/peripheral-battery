@@ -201,7 +201,7 @@ def run_with(runtime, panel_only=False):
         html=load_html(),
         width=WINDOW_W,
         height=WINDOW_H,
-        resizable=True,
+        resizable=False,
         background_color="#F4F0E7",
         js_api=api,
     )

@@ -37,6 +37,10 @@ DEVICES = [JD_MOUSE, PMO_KEYBOARD]
 # RDR 接收器可能配对的键盘 pid（P75 / PMO 80 / Aurora 80 / WAVE 75）
 PAIRED_PIDS = {0x302B, 0x3012, 0x3004, 0x3009}
 
+# 0xD0 状态帧末字节：实测 04 = 正常，05 = 假休眠（接收器仍报连着但键盘不应答）
+PMO_STATE_OK = 0x04
+PMO_STATE_FAKE_SLEEP = 0x05
+
 
 # --- 贱驴鼠标 -------------------------------------------------------------
 JD_REQ_ID = 0xB3
@@ -181,9 +185,15 @@ def read_pmo_keyboard(iface, trace=None, interfaces=None):
                 finally:
                     _pmo_cmd(h, rid, PMO_STOP, timeout=0.3)
 
-    # 退一步：用接收器自己的状态通道判断键盘是不是根本没上线
-    alive = _pmo_presence(interfaces, trace)
-    if alive:
+    # 退一步：用接收器自己的状态通道判断键盘到底处于什么状态
+    presence = _pmo_presence(interfaces, trace)
+    alive, state_byte = presence if presence else (None, 0)
+    if alive and state_byte == PMO_STATE_FAKE_SLEEP:
+        # 接收器说还连着（state=05），但配置通道完全不应答 —— 固件假休眠
+        result.update(state="fake_sleep",
+                      detail="键盘假休眠：接收器仍报已连接，但键盘不应答；"
+                             "需切到蓝牙再切回 2.4G 才能恢复")
+    elif alive:
         result.update(state="idle",
                       detail=detail or "键盘已配对但不响应电量查询（按一下键唤醒再试）")
     elif alive is False:
@@ -260,8 +270,10 @@ def read_pmo_funcinfo(iface=None, interfaces=None, trace=None):
 
 
 def _pmo_presence(interfaces, trace=None):
-    """0xFF60 通道上的 0xD0 轮询：能拿到回复说明接收器在，但键盘未必醒着。"""
-    """0xFF60 通道上的 0xD0 轮询：能拿到回复说明接收器在，但键盘未必醒着。"""
+    """0xFF60 通道上的 0xD0 轮询。
+
+    返回 (配对是否匹配, 状态字节)；状态字节 04 = 正常，05 = 假休眠。
+    """
     if not interfaces:
         return None
     iface = find_interface(interfaces, PMO_KEYBOARD["vid"], PMO_KEYBOARD["pid"], 0xFF60)
@@ -290,8 +302,10 @@ def _pmo_presence(interfaces, trace=None):
             if len(data) >= 8 and data[1] == PMO_MARK and data[2] == 0xD0:
                 pvid = data[10] | (data[11] << 8)
                 ppid = data[12] | (data[13] << 8)
-                return pvid == PMO_KEYBOARD["vid"] and ppid in PAIRED_PIDS
-    return False
+                state_byte = data[14] if len(data) > 14 else 0
+                return (pvid == PMO_KEYBOARD["vid"] and ppid in PAIRED_PIDS,
+                        state_byte)
+    return None
 
 
 # --- 统一入口 -------------------------------------------------------------
