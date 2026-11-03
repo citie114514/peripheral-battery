@@ -358,8 +358,13 @@ function tweenNumber(target){
 }
 
 /* ---------- 文案 ---------- */
-function headline(pct){
+function headline(pct, charging){
   if (pct === null || pct === undefined) return ['一眼没看清，', '稍后再问我。'];
+  if (charging) {
+    if (pct >= 95) return ['已经喝饱了，', '拔线就行。'];
+    if (pct >= 60) return ['正在补着呢，', '不用管它。'];
+    return ['正在充电中，', '慢慢等着。'];
+  }
   if (pct >= 60) return ['电量还够，', '不必惦记。'];
   if (pct >= 30) return ['电量过半，', '还能撑会儿。'];
   return ['电量见底，', '这就去充电。'];
@@ -370,13 +375,35 @@ const levelColor = (p) => p === null || p === undefined ? 'var(--muted)'
 /* ---------- 小图 ---------- */
 function art(kind){
   if (kind === 'keyboard'){
+    // 画成 75% 配列的缩影：外壳、4 行键帽（含空格键），全部共用一套坐标
+    const BX = 32, BY = 40, BW = 176, BH = 70, PAD = 9;
+    const gap = 3;
+    const innerW = BW - PAD * 2;
+    const innerH = BH - PAD * 2;
+    const rowH = (innerH - gap * 3) / 4;
+    // 每行键帽的宽度权重（最后一行的空格键特别宽）
+    const rows = [
+      [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1.5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1.75, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 1, 1, 6, 1, 1, 1, 1],
+    ];
     let keys = '';
-    for (let r = 0; r < 3; r++) for (let c = 0; c < 12; c++){
-      keys += `<rect x="${18+c*15}" y="${14+r*17}" width="12" height="13" rx="3" fill="#efe9de" stroke="#ddd5c6"/>`;
-    }
+    rows.forEach((weights, r) => {
+      const sum = weights.reduce((a, b) => a + b, 0);
+      const unit = (innerW - gap * (weights.length - 1)) / sum;
+      let x = BX + PAD;
+      const y = BY + PAD + r * (rowH + gap);
+      weights.forEach(w => {
+        const kw = unit * w;
+        keys += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${kw.toFixed(1)}" ` +
+                `height="${rowH.toFixed(1)}" rx="2" fill="#efe9de" stroke="#ddd5c6" stroke-width="0.7"/>`;
+        x += kw + gap;
+      });
+    });
     return `<svg viewBox="0 0 240 150">
-      <rect class="pulse" x="40" y="30" width="160" height="90" rx="10" fill="#c2593c"/>
-      <rect x="40" y="30" width="160" height="90" rx="10" fill="#fbf8f2" stroke="#8e8678" stroke-width="1.6"/>
+      <rect class="pulse" x="${BX}" y="${BY}" width="${BW}" height="${BH}" rx="7" fill="#c2593c"/>
+      <rect x="${BX}" y="${BY}" width="${BW}" height="${BH}" rx="7" fill="#fbf8f2" stroke="#8e8678" stroke-width="1.5"/>
       ${keys}</svg>
       <div class="callout c1">2.4G</div><div class="callout c3">rdr link</div>`;
   }
@@ -405,7 +432,7 @@ function render(s){
   const pct = stale ? d.last.percent : live;
   const charging = stale ? !!d.last.charging : !!d.charging;
 
-  const [a, b] = headline(pct);
+  const [a, b] = headline(pct, charging);
   if ($('h1a').textContent !== a || $('h1b').textContent !== b){
     $('h1a').textContent = a; $('h1b').textContent = b;
     document.querySelectorAll('h1 .line span').forEach(el => {
